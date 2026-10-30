@@ -243,33 +243,122 @@ but check it before you rely on it.
 **Your stack.** The command that brought the stack up with two copies, and how
 many distinct `X-Upstream` values your runs saw.
 
+```
+docker compose up -d --build --scale api=2
+docker compose ps        # f26-lab09-api-1, f26-lab09-api-2, f26-lab09-proxy-1
+docker compose logs api  # each copy prints its own u-1 and u-2 tokens
+```
+
+Two distinct `X-Upstream` values through the proxy (`172.19.0.3:8080` and
+`172.19.0.2:8080`). `load/tokens.js` counts them itself in a
+`distinct_upstreams` gauge, and its threshold fails the run below two.
+
+`k6` has no `depends_on` in `compose.yaml` on purpose. With
+`depends_on: [proxy]`, `docker compose run k6` reconciled `proxy -> api` and
+removed `api-2` before the script started. That run reported 20/20 tokens
+accepted with `distinct_upstreams` = 1, which is a pass that could not have seen
+the problem.
+
 ### Finding 1: tokens
 
-**The claim.** One sentence, the one your script checks.
+**The claim.** A token works on any request, whichever copy answers it.
 
 **The script and its result.** The file in `load/`, its threshold, and what a
 run printed.
 
+`load/tokens.js` sends one copy's `u-1` token 20 times to `GET /bookings`
+through the proxy (`http://proxy`).
+
+```
+docker compose run --rm -e TOKEN=<u-1 token from api-1> k6 run /load/tokens.js
+```
+
+Thresholds: `checks{claim:token-works-on-any-copy}: rate==1` (every request
+gets a 200), and `distinct_upstreams: value>=2` (the guard: both copies
+answered).
+
+Run with two copies (k6 exit 99, claim **fails**):
+
+```
+status codes by copy (X-Upstream): {"172.19.0.3:8080":{"200":12},"172.19.0.2:8080":{"401":8}}
+checks{claim:token-works-on-any-copy}  ✗ 'rate==1' rate=60.00%
+distinct_upstreams                     ✓ 'value>=2' value=2
+```
+
+Run with one copy (the accidental scale-down above): claim 100%, guard ✗
+`value=1`. So the claim check passes only when it cannot see the problem.
+
 **Why, from the code.** The class that keeps tokens and how it is wired into
 each copy. Say how you found it.
 
+Tokens are kept only in a hashmap in TokenService. CampusReservePlatform creates a separate TokenService with its own random token generator(CampusReservePlatform.java:53) so each copy creates and accepts only its own tokens. A token from api-1 that goes to api-2 would miss.
+
 **The kind of problem.** Use the vocabulary from lecture.
+This is a state problem. The platform is trying to horizontally scale but without storing the state in a unified location misses between copies can occur. Copies aren't interchangeable behind a load balancer. 
 
 ### Finding 2: bookings
 
-**The claim.**
+**The claim.** A room slot is booked at most once.
 
 **The script and its result.** Say how it reaches each copy directly, and why
 it has to.
 
+`load/bookings.js` posts the same `roomId=r-1`, `start`, `minutes=60` twice:
+once to `http://f26-lab09-api-1:8080` with api-1's `u-1` token, and once to
+`http://f26-lab09-api-2:8080` with api-2's `u-2` token. Those are the container
+names `docker compose ps` shows, resolved by Docker's DNS on the stack's
+network. It skips the proxy because of Finding 1: through the proxy, a token
+from one copy gets a 401 from the other about half the time, and the request
+never reaches the conflict check. The slot is 2–13 days out, inside opening
+hours and on a 15-minute boundary, because `r-1` is a `STUDY_ROOM`
+(`RoomKind`: at most 14 days ahead).
+
+```
+docker compose run --rm -e TOKEN_A=<u-1 token from api-1> \
+  -e TOKEN_B=<u-2 token from api-2> k6 run /load/bookings.js
+```
+
+Thresholds: `checks{claim:slot-booked-at-most-once}: rate==1` and
+`double_bookings: count==0` (at most one 201 per slot), plus a guard,
+`reached_two_copies: rate==1`. The guard passes only when both copies accepted
+the request (201 or 202) and `res.remote_ip` differs between them.
+
+Run against two copies (k6 exit 99, claim **fails**):
+
+```
+copy A (172.19.0.3) r-1 @ 2026-11-01T15:30:00Z: 201 {"outcome":"confirmed",... "userId":"u-1" ...}
+copy B (172.19.0.2) r-1 @ 2026-11-01T15:30:00Z: 201 {"outcome":"confirmed",... "userId":"u-2" ...}
+checks{claim:slot-booked-at-most-once}  ✗ 'rate==1' rate=0.00%
+double_bookings                         ✗ 'count==0' count=1
+reached_two_copies                      ✓ 'rate==1' rate=100.00%
+```
+
+Control, with both requests sent to api-1 (`-e COPY_B=http://f26-lab09-api-1:8080`
+and api-1's `u-2` token). The claim passes and the guard fails:
+
+```
+copy A (172.19.0.3) r-1 @ 2026-11-11T17:30:00Z: 201 {"outcome":"confirmed",...}
+copy B (172.19.0.3) r-1 @ 2026-11-11T17:30:00Z: 202 {"outcome":"waitlisted",... "position":1}
+checks{claim:slot-booked-at-most-once}  ✓   double_bookings ✓   reached_two_copies ✗
+```
+
+Each run leaves one active booking per user on each copy. The default policy
+caps a user at 5 active bookings, so bring the stack up fresh after a few runs.
+
 **Why, from the code.**
 
+BookingService.requestBookings reads this copy's bookings, checks for a conflict, and saves. Each copy's bookings live in their own memory, so api-2 checking for conflicts can't see that api-1 already booked a slot. 
+
 **The kind of problem.**
+
+The state-based invariant is checking local-only state, so this is again a state issue caused by not have a single soruce of truth.
 
 ### What you checked
 
 One thing your agent proposed that you checked (what it proposed, how you
 checked it, and what came of it).
+
+I checked the finding 2 under milestone by running the script against 2 api copies with generated tokens to confirm the output matches agent's claim. 
 
 ---
 
