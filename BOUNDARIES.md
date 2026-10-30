@@ -358,7 +358,7 @@ The state-based invariant is checking local-only state, so this is again a state
 One thing your agent proposed that you checked (what it proposed, how you
 checked it, and what came of it).
 
-I checked the finding 2 under milestone by running the script against 2 api copies with generated tokens to confirm the output matches agent's claim. 
+I checked the finding 2 under milestone by running the script against 2 api copies with generated tokens to confirm the output matches agent's claim. . 
 
 ---
 
@@ -366,17 +366,65 @@ I checked the finding 2 under milestone by running the script against 2 api copi
 
 Take one problem from Milestone 1 or 2 and propose the boundary that fixes it.
 
+The problem: Finding 2. Two copies each confirmed `r-1` for the same hour,
+because `BookingService` checks its own copy's map and then saves
+(`BookingService.java:112-124`).
+
 **The boundary.** The port, what it promises, and which side implements it. Say what
 moves and what stays.
+
+Add one method to the `BookingStore` port in `core-domain`:
+`holdIfFree(roomId, decide)`. It promises to take an exclusive lock on that
+room, shared across every copy. Under the lock it hands `decide` the room's
+active bookings as committed by all copies, saves the booking `decide` returns,
+and only then releases the lock. `storage` implements it twice: the existing
+`InMemoryBookingStore` with a per-room lock (for tests and a single copy), and a
+new shared database store (`SELECT ... FROM rooms WHERE id = ? FOR UPDATE`,
+then the insert in the same transaction). What moves: the three writes that
+hold a room (`requestBooking` `:112-124`, `modifyBooking` `:200-209`, and
+promotion `:288-306`) go inside the callback. What stays: the overlap test
+(`ConflictChecker` → `TimeInterval.overlaps`), the waitlist writes in
+`BookingService`, and tokens, event log, and outbox, which stay per copy.
 
 **Who owns the data.** Name the module that owns the data this boundary is about,
 and say what everybody else is allowed to do with it.
 
+`storage` owns booking rows. They live in one database for the whole platform,
+not in one `ConcurrentHashMap` per copy. `BookingService` is the only caller
+that may write a booking that holds a room, and only through `holdIfFree`.
+A plain `save` is left only for cancellations, which free time and so can never
+create an overlap. Everyone else (`AvailabilityService`, `http-api`, `cli`,
+`billing`) may read bookings through the port's `find*` methods. They must
+treat a read as advisory: a slot shown free may be gone by the time they ask
+for it.
+
 **The one invariant that must not cross.** Exactly one, stated so that a reader
 can tell whether a given piece of code violates it.
 
+No two bookings that hold the same room overlap. That means any code that saves
+a booking with `holdsRoom()` true without being inside `holdIfFree` for that
+room breaks the invariant, and so does a `decide` that judged overlap against
+anything but the bookings the lock handed it.
+
 **What the boundary costs.** An interface to keep, a second implementation to
 maintain, a performance argument to have again. Include what it leaves unfixed.
+
+- **What you have to maintain.**
+  - Two implementations must pass one contract test for the port.
+  - The platform takes its first runtime dependency (a JDBC driver) and adds a
+    `db` service to `compose.yaml`.
+  - The overlap check must stay in Java under the row lock. A database
+    exclusion constraint would be a second overlap predicate, which AGENTS.md
+    rule 3 forbids.
+- **Performance.** A booking write goes from a local map lookup (median about
+  0.4 ms per request in our k6 runs) to a database transaction, and bookings for
+  one room now queue behind each other across every copy. The shipped
+  performance work has to be argued again against that.
+- **What it leaves unfixed.**
+  - Finding 1: tokens are still per process.
+  - The per-user cap and own-calendar check (`checkAskerLimits`, `:337-342`)
+    still race across copies, because the lock covers the room, not the user.
+  - Each copy's `InMemoryEventLog` and outbox still diverge from the other's.
 
 Feel free to read the appendix on what a good proposal looks like in the Lab 3 handout
 before you write this section.
